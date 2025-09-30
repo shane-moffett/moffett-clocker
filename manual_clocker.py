@@ -3,6 +3,15 @@ from datetime import datetime
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageTk  # ImageTk for Tk icon
 
+# -------------------------------------------------------------------
+# TWILIO SETUP (reads credentials from environment variables)
+#   Set these in PowerShell (per-user):
+#     setx TWILIO_ACCOUNT_SID "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+#     setx TWILIO_AUTH_TOKEN  "your_auth_token_here"
+#     setx TWILIO_FROM_E164   "+1xxxxxxxxxx"   # SMS-capable Twilio number
+#   Then restart the app/terminal.
+# -------------------------------------------------------------------
+
 # --------------------------
 # CONSTANTS & PATHS
 # --------------------------
@@ -35,6 +44,13 @@ DEFAULT_SETTINGS = {
     "on_idle_after_hour": 0,               # only show this after (0–23). 0 = always allowed
     "max_clock_out_per_day": 3,            # daily max
 
+    # SMS clock-out reminder (max 1/day)
+    "enable_sms_clock_out_reminder": False,
+    "sms_phone_e164": "",                  # normalized +E.164 (e.g., +358401234567)
+    "sms_only_after_hour": 0,              # 0–23
+    "sms_idle_threshold_min": 60,          # minutes
+    "sms_max_per_day": 1,                  # fixed 1/day as requested
+
     # General (not user-exposed)
     "active_idle_cutoff_sec": 300          # idle >= this resets "active" streak (seconds)
 }
@@ -44,7 +60,7 @@ _settings_cache = None
 _config_window_open = False
 
 # --------------------------
-# SETTINGS IO (simple)
+# SETTINGS IO
 # --------------------------
 def ensure_settings_file():
     """If settings.json doesn't exist, create it with defaults once."""
@@ -104,17 +120,21 @@ def _today():
 def _load_counts():
     os.makedirs(APPDATA_DIR, exist_ok=True)
     today = _today()
-    data = {"date": today, "on": 0, "off": 0}
+    data = {"date": today, "on": 0, "off": 0, "sms": 0}
     try:
         if os.path.exists(COUNTS_FILE):
             with open(COUNTS_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f) or {}
             if loaded.get("date") == today:
-                data = {**data, **{k: int(loaded.get(k, 0)) for k in ("on", "off")}}
+                # keep backward compatible if 'sms' missing
+                data = {
+                    **data,
+                    **{k: int(loaded.get(k, 0)) for k in ("on", "off", "sms")}
+                }
     except Exception:
         pass
     if data.get("date") != today:
-        data = {"date": today, "on": 0, "off": 0}
+        data = {"date": today, "on": 0, "off": 0, "sms": 0}
     return data
 
 def _save_counts(data):
@@ -136,9 +156,8 @@ def inc_count(kind: str):
 # --------------------------
 # EMBEDDED ICONS
 # --------------------------
-m_on_b64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAC4jAAAuIwF4pT92AAAGhWlUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4gPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iQWRvYmUgWE1QIENvcmUgOS4xLWMwMDMgNzkuOTY5MGE4NywgMjAyNS8wMy8wNi0xOToxMjowMyAgICAgICAgIj4gPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4gPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIiB4bWxuczpkYz0iaHR0cDovL3B1cmwub3JnL2RjL2VsZW1lbnRzLzEuMS8iIHhtbG5zOnBob3Rvc2hvcD0iaHR0cDovL25zLmFkb2JlLmNvbS9waG90b3Nob3AvMS4wLyIgeG1sbnM6eG1wTU09Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9tbS8iIHhtbG5zOnN0RXZ0PSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvc1R5cGUvUmVzb3VyY2VFdmVudCMiIHhtcDpDcmVhdG9yVG9vbD0iQWRvYmUgUGhvdG9zaG9wIDI2LjExICgyMDI1MDkwNy5tLjMyMTEgYjgzMjczNykgIChXaW5kb3dzKSIgeG1wOkNyZWF0ZURhdGU9IjIwMjUtMDktMTBUMTc6MDc6MDArMDI6MDAiIHhtcDpNb2RpZnlEYXRlPSIyMDI1LTA5LTEwVDE3OjE5OjIzKzAyOjAwIiB4bXA6TWV0YWRhdGFEYXRlPSIyMDI1LTA5LTEwVDE3OjE5OjIzKzAyOjAwIiBkYzpmb3JtYXQ9ImltYWdlL3BuZyIgcGhvdG9zaG9wOkNvbG9yTW9kZT0iMyIgeG1wTU06SW5zdGFuY2VJRD0ieG1wLmlpZDoxYjNiNjI3Yy01ZTFjLTVhNGQtOGUxNy00Mzk5ZGFmNWU1ZDkiIHhtcE1NOkRvY3VtZW50SUQ9ImFkb2JlOmRvY2lkOnBob3Rvc2hvcDpmNDAxMmQyZC05NzhmLWU2NDktODQxOS04MjQwNGFmZTczZTAiIHhtcE1NOk9yaWdpbmFsRG9jdW1lbnRJRD0ieG1wLmRpZDozZDRjMWJiNC0zOWM2LTkzNDUtYTczMS0wZWEzMjI5NGEzZGYiPiA8eG1wTU06SGlzdG9yeT4gPHJkZjpTZXE+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJjcmVhdGVkIiBzdEV2dDppbnN0YW5jZUlEPSJ4bXAuaWlkOjNkNGMxYmI0LTM5YzYtOTM0NS1hNzMxLTBlYTMyMjk0YTNkZiIgc3RFdnQ6d2hlbj0iMjAyNS0wOS0xMFQxNzowNzowMCswMjowMCIgc3RFdnQ6c29mdHdhcmVBZ2VudD0iQWRvYmUgUGhvdG9zaG9wIDI2LjExICgyMDI1MDkwNy5tLjMyMTEgYjgzMjczNykgIChXaW5kb3dzKSIvPiA8cmRmOmxpIHN0RXZ0OmFjdGlvbj0iY29udmVydGVkIiBzdEV2dDpwYXJhbWV0ZXJzPSJmcm9tIGFwcGxpY2F0aW9uL3ZuZC5hZG9iZS5waG90b3Nob3AgdG8gaW1hZ2UvcG5nIi8+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJzYXZlZCIgc3RFdnQ6aW5zdGFuY2VJRD0ieG1wLmlpZDoxYjNiNjI3Yy01ZTFjLTVhNGQtOGUxNy00Mzk5ZGFmNWU1ZDkiIHN0RXZ0OndoZW49IjIwMjUtMDktMTBUMTc6MTk6MjMrMDI6MDAiIHN0RXZ0OnNvZnR3YXJlQWdlbnQ9IkFkb2JlIFBob3Rvc2hvcCAyNi4xMSAoMjAyNTA5MDcubS4zMjExIGI4MzI3MzcpICAoV2luZG93cykiIHN0RXZ0OmNoYW5nZWQ9Ii8iLz4gPC9yZGY6U2VxPiA8L3htcE1NOkhpc3Rvcnk+IDwvcmRmOkRlc2NyaXB0aW9uPiA8L3JkZjpSREY+IDwveDp4bXBtZXRhPiA8P3hwYWNrZXQgZW5kPSJyIj8+wWkmkAAAAxxJREFUeNrtmk1IVGEUhicrMGIGiiBBCCmM6GcTCiEVgauihQaRYPRDBOUihCgqWhjhzyrJwAKjn0VECUmbKERbRS6sRfSzqI2EkSiWFpSF3c6FO3DRb86x834XcuYs3o2MD+c+880733fvpIIgSBVyUibABJgAE2ACTIAJMAEmwASYADYf0xsXULZRrlJeUiYpwX+aEcpzSielllIMCSDA2ggYzNN8oTRTMv8sgP6pgvJ1Hl98PMOUrXMWQC9eTvmUJxefzS/KrrkKuJxnF5/NN0o5K4BesIzyPU8FhOmTBBzJ44vPppIT0F0AAi5xAj4XgIDBXBdfWgAXH2Yyl4A9AHSa0kWpo9TMSLgrm1Jy70aMg5QLlKc+JOQS0AxAzws7Si231sGroowlIeCxEvgn3DwxAuqBYUtzMA8kIWBUCXwjbKw6tFtYhpn2KoD+uAoA3hAEDCi5DwTuhLcSBAvwGDPkYqAAzwgCfiu5Lb4LcDMzZCXArWa4JQB3t88C/EFZxAzaABRrhuFWAwJW+izAZ8Iyva3kvhW4J5XcoVmHIbAA24VB3ym5twTuPSW32yUAKcA6ZshMtJQ13AZBwJCSe9olACnANQl9TisSKsAdLgHaAhwT3qWzSu7P8OuT4dYA55W0S4C2AB8JAnqU3AGB24ruWOOwMmA5NQmDDiu5HQK3X8m96RKwFxCwkxkSubdQz3AXRjc3NdzjLgFtwKArmEGRb5ZyhrvJR7HGgb1K2AdhmWrFjoeP4xjuUSV3Kl6sceC49k6NIKBPyX0icK/7KNYsbDWwnBqZIYuAh6gXBQGvldwrLgFIAVYxQ65HTmrCTZBpJXe/S4D2cxqew5cwgx5CTmoJ7SzXuQRoC/CFsEw7kZMawz2n5E7MLFa0AK8Jgw4qufcF7kMlt3fW7wPAAjzMDFkM3Ko6JQgY0d4CcwlACnADM+QWgLud4Zb5fLaAFGC4DS1iBj0BnNSWMtx9Pp8tIAXYLyzTO0ruK4Hb7vPZAlKAbcKg75XcLoGr/bFWj/1O0ASYABNgAkyACTABJsAEmAATYAIiAX8B4GS/l8f2X4AAAAAASUVORK5CYII=" 
+m_on_b64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAC4jAAAuIwF4pT92AAAGhWlUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4gPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iQWRvYmUgWE1QIENvcmUgOS4xLWMwMDMgNzkuOTY5MGE4NywgMjAyNS8wMy8wNi0xOToxMjowMyAgICAgICAgIj4gPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4gPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIiB4bWxuczpkYz0iaHR0cDovL3B1cmwub3JnL2RjL2VsZW1lbnRzLzEuMS8iIHhtbG5zOnBob3Rvc2hvcD0iaHR0cDovL25zLmFkb2JlLmNvbS9waG90b3Nob3AvMS4wLyIgeG1sbnM6eG1wTU09Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9tbS8iIHhtbG5zOnN0RXZ0PSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvc1R5cGUvUmVzb3VyY2VFdmVudCMiIHhtcDpDcmVhdG9yVG9vbD0iQWRvYmUgUGhvdG9zaG9wIDI2LjExICgyMDI1MDkwNy5tLjMyMTEgYjgzMjczNykgIChXaW5kb3dzKSIgeG1wOkNyZWF0ZURhdGU9IjIwMjUtMDktMTBUMTc6MDc6MDArMDI6MDAiIHhtcDpNb2RpZnlEYXRlPSIyMDI1LTA5LTEwVDE3OjE5OjIzKzAyOjAwIiB4bXA6TWV0YWRhdGFEYXRlPSIyMDI1LTA5LTEwVDE3OjE5OjIzKzAyOjAwIiBkYzpmb3JtYXQ9ImltYWdlL3BuZyIgcGhvdG9zaG9wOkNvbG9yTW9kZT0iMyIgeG1wTU06SW5zdGFuY2VJRD0ieG1wLmlpZDoxYjNiNjI3Yy01ZTFjLTVhNGQtOGUxNy00Mzk5ZGFmNWU1ZDkiIHhtcE1NOkRvY3VtZW50SUQ9ImFkb2JlOmRvY2lkOnBob3Rvc2hvcDpmNDAxMmQyZC05NzhmLWU2NDktODQxOS04MjQwNGFmZTczZTAiIHhtcE1NOk9yaWdpbmFsRG9jdW1lbnRJRD0ieG1wLmRpZDozZDRjMWJiNC0zOWM2LTkzNDUtYTczMS0wZWEzMjI5NGEzZGYiPiA8eG1wTU06SGlzdG9yeT4gPHJkZjpTZXE+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJjcmVhdGVkIiBzdEV2dDppbnN0YW5jZUlEPSJ4bXAuaWlkOjNkNGMxYmI0LTM5YzYtOTM0NS1hNzMxLTBlYTMyMjk0YTNkZiIgc3RFdnQ6d2hlbj0iMjAyNS0wOS0xMFQxNzowNzowMCswMjowMCIgc3RFdnQ6c29mdHdhcmVBZ2VudD0iQWRvYmUgUGhvdG9zaG9wIDI2LjExICgyMDI1MDkwNy5tLjMyMTEgYjgzMjczNykgIChXaW5kb3dzKSIvPiA8cmRmOmxpIHN0RXZ0OmFjdGlvbj0iY29udmVydGVkIiBzdEV2dDpwYXJhbWV0ZXJzPSJmcm9tIGFwcGxpY2F0aW9uL3ZuZC5hZG9iZS5waG90b3Nob3AgdG8gaW1hZ2UvcG5nIi8+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJzYXZlZCIgc3RFdnQ6aW5zdGFuY2VJRD0ieG1wLmlpZDoxYjNiNjI3Yy01ZTFjLTVhNGQtOGUxNy00Mzk5ZGFmNWU1ZDkiIHN0RXZ0OndoZW49IjIwMjUtMDktMTBUMTc6MTk6MjMrMDI6MDAiIHN0RXZ0OnNvZnR3YXJlQWdlbnQ9IkFkb2JlIFBob3Rvc2hvcCAyNi4xMSAoMjAyNTA5MDcubS4zMjExIGI4MzI3MzcpICAoV2luZG93cykiIHN0RXZ0OmNoYW5nZWQ9Ii8iLz4gPC9yZGY6U2VxPiA8L3htcE1NOkhpc3Rvcnk+IDwvcmRmOkRlc2NyaXB0aW9uPiA8L3JkZjpSREY+IDwveDp4bXBtZXRhPiA8P3hwYWNrZXQgZW5kPSJyIj8+wWkmkAAAAxxJREFUeNrtmk1IVGEUhicrMGIGiiBBCCmM6GcTCiEVgauihQaRYPRDBOUihCgqWhjhzyrJwAKjn0VECUmbKERbRS6sRfSzqI2EkSiWFpSF3c6FO3DRb86x834XcuYs3o2MD+c+880733fvpIIgSBVyUibABJgAE2ACTIAJMAEmwASYADYf0xsXULZRrlJeUiYpwX+aEcpzSielllIMCSDA2ggYzNN8oTRTMv8sgP6pgvJ1Hl98PMOUrXMWQC9eTvmUJxefzS/KrrkKuJxnF5/NN0o5K4BesIzyPU8FhOmTBBzJ44vPppIT0F0AAi5xAj4XgIDBXBdfWgAXH2Yyl4A9AHSa0kWpo9TMSLgrm1Jy70aMg5QLlKc+JOQS0AxAzws7Si231sGroowlIeCxEvgn3DwxAuqBYUtzMA8kIWBUCXwjbKw6tFtYhpn2KoD+uAoA3hAEDCi5DwTuhLcSBAvwGDPkYqAAzwgCfiu5Lb4LcDMzZCXArWa4JQB3t88C/EFZxAzaABRrhuFWAwJW+izAZ8Iyva3kvhW4J5XcoVmHIbAA24VB3ym5twTuPSW32yUAKcA6ZshMtJQ13AZBwJCSe9olACnANQl9TisSKsAdLgHaAhwT3qWzSu7P8OuT4dYA55W0S4C2AB8JAnqU3AGB24ruWOOwMmA5NQmDDiu5HQK3X8m96RKwFxCwkxkSubdQz3AXRjc3NdzjLgFtwKArmEGRb5ZyhrvJR7HGgb1K2AdhmWrFjoeP4xjuUSV3Kl6sceC49k6NIKBPyX0icK/7KNYsbDWwnBqZIYuAh6gXBQGvldwrLgFIAVYxQ65HTmrCTZBpJXe/S4D2cxqew5cwgx5CTmoJ7SzXuQRoC/CFsEw7kZMawz2n5E7MLFa0AK8Jgw4qufcF7kMlt3fW7wPAAjzMDFkM3Ko6JQgY0d4CcwlACnADM+QWgLud4Zb5fLaAFGC4DS1iBj0BnNSWMtx9Pp8tIAXYLyzTO0ruK4Hb7vPZAlKAbcKg75XcLoGr/bFWj/1O0ASYABNgAkyACTABJsAEmAATYAIiAX8B4GS/l8f2X4AAAAAASUVORK5CYII="
 m_off_b64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAC4jAAAuIwF4pT92AAAGhWlUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4gPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iQWRvYmUgWE1QIENvcmUgOS4xLWMwMDMgNzkuOTY5MGE4NywgMjAyNS8wMy8wNi0xOToxMjowMyAgICAgICAgIj4gPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4gPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIiB4bWxuczpkYz0iaHR0cDovL3B1cmwub3JnL2RjL2VsZW1lbnRzLzEuMS8iIHhtbG5zOnBob3Rvc2hvcD0iaHR0cDovL25zLmFkb2JlLmNvbS9waG90b3Nob3AvMS4wLyIgeG1sbnM6eG1wTU09Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9tbS8iIHhtbG5zOnN0RXZ0PSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvc1R5cGUvUmVzb3VyY2VFdmVudCMiIHhtcDpDcmVhdG9yVG9vbD0iQWRvYmUgUGhvdG9zaG9wIDI2LjExICgyMDI1MDkwNy5tLjMyMTEgYjgzMjczNykgIChXaW5kb3dzKSIgeG1wOkNyZWF0ZURhdGU9IjIwMjUtMDktMTBUMTc6MDc6MDArMDI6MDAiIHhtcDpNb2RpZnlEYXRlPSIyMDI1LTA5LTEwVDE3OjE5OjQ0KzAyOjAwIiB4bXA6TWV0YWRhdGFEYXRlPSIyMDI1LTA5LTEwVDE3OjE5OjQ0KzAyOjAwIiBkYzpmb3JtYXQ9ImltYWdlL3BuZyIgcGhvdG9zaG9wOkNvbG9yTW9kZT0iMyIgeG1wTU06SW5zdGFuY2VJRD0ieG1wLmlpZDpiOGNlNTc4ZC1hZDM4LWUwNDctODRlYi1hMTNmNGVhNTE0NzgiIHhtcE1NOkRvY3VtZW50SUQ9ImFkb2JlOmRvY2lkOnBob3Rvc2hvcDoyM2UwZmRmMy01YThjLTFiNGItYTBkYy02NzNjNjM0OTQzYmMiIHhtcE1NOk9yaWdpbmFsRG9jdW1lbnRJRD0ieG1wLmRpZDo2ZDRlMTUyMS0yZGMwLTA3NGItYTFkNS01NWVjZmQwODE3ZmQiPiA8eG1wTU06SGlzdG9yeT4gPHJkZjpTZXE+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJjcmVhdGVkIiBzdEV2dDppbnN0YW5jZUlEPSJ4bXAuaWlkOjZkNGUxNTIxLTJkYzAtMDc0Yi1hMWQ1LTU1ZWNmZDA4MTdmZCIgc3RFdnQ6d2hlbj0iMjAyNS0wOS0xMFQxNzowNzowMCswMjowMCIgc3RFdnQ6c29mdHdhcmVBZ2VudD0iQWRvYmUgUGhvdG9zaG9wIDI2LjExICgyMDI1MDkwNy5tLjMyMTEgYjgzMjczNykgIChXaW5kb3dzKSIvPiA8cmRmOmxpIHN0RXZ0OmFjdGlvbj0iY29udmVydGVkIiBzdEV2dDpwYXJhbWV0ZXJzPSJmcm9tIGFwcGxpY2F0aW9uL3ZuZC5hZG9iZS5waG90b3Nob3AgdG8gaW1hZ2UvcG5nIi8+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJzYXZlZCIgc3RFdnQ6aW5zdGFuY2VJRD0ieG1wLmlpZDpiOGNlNTc4ZC1hZDM4LWUwNDctODRlYi1hMTNmNGVhNTE0NzgiIHN0RXZ0OndoZW49IjIwMjUtMDktMTBUMTc6MTk6NDQrMDI6MDAiIHN0RXZ0OnNvZnR3YXJlQWdlbnQ9IkFkb2JlIFBob3Rvc2hvcCAyNi4xMSAoMjAyNTA5MDcubS4zMjExIGI4MzI3MzcpICAoV2luZG93cykiIHN0RXZ0OmNoYW5nZWQ9Ii8iLz4gPC9yZGY6U2VxPiA8L3htcE1NOkhpc3Rvcnk+IDwvcmRmOkRlc2NyaXB0aW9uPiA8L3JkZjpSREY+IDwveDp4bXBtZXRhPiA8P3hwYWNrZXQgZW5kPSJyIj8+U0ghxQAAAv1JREFUeNrtmk1IVFEYhkdLMEIhCQqEkMKIok0ohFQErooWGkSC0Q8RlIsIoniKFkVYrpIMLDD6WUSUkLSJQrRV5MJaRD+L2rgwkqQygzKx22aEjJnz2fd9AzlzBs72mfc8c+577zl3UkmSpAp5pKKAKCAKiAKigCggCogCooAooEAFzPYDFAEbgcvAc+ArkPynYwR4CnQCjUBpyvIBVqaByRwdn4FWoFwz+Rrgyxye/J9jGNjwL5OvAN7nyeSnx09g62wFXMyzyU+PcaBamvwi4FueCkiAPknA/jye/PSoDQnoLgABF0ICPhSAgMFsk68sgMknwNdsArYboFNAF9AENPw1GoEJJfd2mrEHOAM89pCQTUCrAXpKeKLUchsz8OqA0VwIeKgE/gIqAgKaDWErszB350LARyXwlXBr7dA+wgaYZa4CgGUG4DVBwICSe0/gjrmVoLEADwZClhgKEEHApJJ7zrsA1wVC1hq49QHuUgN3m2cBfgfmB4K2GIq1PMCtNwhY4lmAT4RlelPJfS1wjyq5Q94F2C4EfaPk3hC4d5Tcbu8CbAqELE8vZQ23RRAwpOQe9y7AFTm6TmtyVICbPQtwVPiVTii5P4CSALfBsF8p8yzAB4KAHiV3QOCed3tiBaoMy+m0EHRYye0QuP1K7vVMsB0GAVsCIS1nC80B7rz04aaGeygTsM0QdHEgqOXOUh3grnUtVqBXCXsnLFOt2E9AUYB7QMmdyFis6S9UndQIAvqU3EcC96pbsQLLDcvpSCBkseEl6llBwEsl95J3AdYFQq523anNPASZUnJ3eV6nk8CCQNC9rjs1nyfLVZ4F+ExYpp1uO7WZ3JNK7ljGYjUU4BUh6KCSe1fg3ldye70LcF8gZKnhqOqYIGDE8wjMUoBrAiHXG7ibAtwqz3cLlgIcB4oDQQ8bdmoLA9ydru8WDAXYLyzTW0ruC4Hb7vpuwVCAbULQt0pul8DV/lmrJyMw/lEyCogCooAoIAqIAqKAKCAKiAKigEIU8Bstm0n2N0s2awAAAABJRU5ErkJggg="
-
 
 def load_icon(b64):
     b64 = b64.strip()
@@ -206,6 +225,56 @@ def load_last_on_prompt_epoch():  return _load_epoch_file(LAST_ON_PROMPT_FILE)
 def save_last_on_prompt_epoch(epoch): _save_epoch_file(LAST_ON_PROMPT_FILE, epoch)
 
 # --------------------------
+# PHONE NORMALIZATION + SMS SENDER
+# --------------------------
+def _normalize_phone_e164(raw: str) -> str:
+    """Return +E.164 string or empty if invalid."""
+    try:
+        import phonenumbers
+        num = phonenumbers.parse(str(raw), None)  # requires +country code
+        if phonenumbers.is_valid_number(num):
+            return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+    except Exception:
+        pass
+    try:
+        import re
+        s = re.sub(r"[^\d+]", "", str(raw))
+        if not s.startswith("+"):
+            return ""
+        digits = re.sub(r"\D", "", s[1:])
+        if 8 <= len(digits) <= 15:
+            return "+" + digits
+    except Exception:
+        pass
+    return ""
+
+def _send_sms_twilio(e164: str, body: str) -> bool:
+    """Send SMS using Twilio API. Requires env vars:
+       TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_E164"""
+    try:
+        import os
+        from twilio.rest import Client
+
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+        auth_token  = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+        from_number = os.environ.get("TWILIO_FROM_E164", "").strip()
+
+        if not (account_sid and auth_token and from_number):
+            print("Twilio not configured: set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_E164")
+            return False
+
+        client = Client(account_sid, auth_token)
+        msg = client.messages.create(
+            body=body,
+            from_=from_number,
+            to=e164
+        )
+        return bool(getattr(msg, "sid", None))
+    except Exception as e:
+        print("Twilio send failed:", e)
+        return False
+
+# --------------------------
 # BACKGROUND MONITOR
 # --------------------------
 _current_status = None
@@ -262,6 +331,24 @@ def monitor_loop(icon: Icon):
                             icon.notify("Forgot to clock in?", "Moffett Clocker Helper")
                             save_last_off_prompt_epoch(now)
                             inc_count("off")
+
+            # SMS: ON state independent of desktop reminder
+            if status == "On" and cfg.get("enable_sms_clock_out_reminder", False):
+                sms_after_hour = int(cfg.get("sms_only_after_hour", 0))
+                sms_idle_threshold_sec = int(cfg.get("sms_idle_threshold_min", 60)) * 60
+                sms_limit = max(0, int(cfg.get("sms_max_per_day", 1)))
+                phone = str(cfg.get("sms_phone_e164", "")).strip()
+
+                if phone and idle_s >= sms_idle_threshold_sec and is_after_cutoff_local(sms_after_hour):
+                    if get_count("sms") < sms_limit:
+                        msg = "Still working? You are idle while clocked in. Open HealthBox to clock out: " + BASE_URL
+                        if _send_sms_twilio(phone, msg):
+                            inc_count("sms")
+                            try:
+                                icon.notify("SMS clock-out reminder sent", "Moffett Clocker Helper")
+                            except Exception:
+                                pass
+
         except Exception:
             # keep tray app alive on any unexpected error
             pass
@@ -355,9 +442,21 @@ def open_config(icon, item):
         e_co_cool     = add_entry_row(r, "Min gap between reminders (minutes):", cfg.get("on_idle_prompt_cooldown_min", 210)); r+=1
         e_co_max_day  = add_entry_row(r, "Max reminders per day:", cfg.get("max_clock_out_per_day", 3)); r+=1
 
+        # SMS clock-out reminder (max 1/day)
+        ttk.Label(frm, text="SMS clock-out reminder (max 1/day)", font=("Segoe UI", 10, "bold")).grid(column=0, row=r, columnspan=2, sticky="w", pady=(8,2)); r+=1
+        v_enable_sms  = add_check_row(r, "Send SMS if I go idle", cfg.get("enable_sms_clock_out_reminder", False)); r+=1
+
+        ttk.Label(frm, text="Phone number (+country code):").grid(column=0, row=r, sticky="w", padx=(0,10), pady=2)
+        e_sms_phone = ttk.Entry(frm, width=20, justify="center")
+        e_sms_phone.insert(0, str(cfg.get("sms_phone_e164", "")))
+        e_sms_phone.grid(column=1, row=r, sticky="e"); r+=1
+
+        e_sms_after  = add_entry_row(r, "Only send this after (0–23):", cfg.get("sms_only_after_hour", 0)); r+=1
+        e_sms_idle   = add_entry_row(r, "Idle before SMS reminder (minutes):", cfg.get("sms_idle_threshold_min", 60)); r+=1
+
         ttk.Separator(frm).grid(column=0, row=r, columnspan=2, sticky="ew", pady=10); r+=1
 
-        # Test buttons (optional)
+        # Test buttons
         leftbtns = ttk.Frame(frm); leftbtns.grid(column=0, row=r, sticky="w")
         ttk.Button(leftbtns, text="Test clock-in notification",  command=lambda: icon.notify("Forgot to clock in? (test)", "Moffett Clocker Helper")).grid(column=0, row=0, padx=(0,8))
         ttk.Button(leftbtns, text="Test clock-out notification", command=lambda: icon.notify("Still working? (test)", "Moffett Clocker Helper")).grid(column=1, row=0)
@@ -371,6 +470,15 @@ def open_config(icon, item):
                 return default
 
         def on_save_and_close():
+            # Normalize phone if enabled
+            enable_sms = bool(v_enable_sms.get())
+            raw_phone = e_sms_phone.get().strip()
+            phone_norm = _normalize_phone_e164(raw_phone) if raw_phone else ""
+
+            if enable_sms and not phone_norm:
+                messagebox.showerror("Invalid phone", "Enter a valid phone number with +country code. Example: +358401234567")
+                return
+
             new_cfg = {
                 "enable_clock_in_reminder": bool(v_enable_ci.get()),
                 "clock_in_cutoff_hour": _to_int(e_cutoff.get(),           DEFAULT_SETTINGS["clock_in_cutoff_hour"]),
@@ -384,6 +492,13 @@ def open_config(icon, item):
                 "on_idle_after_hour":       _to_int(e_after_hour.get(),   DEFAULT_SETTINGS["on_idle_after_hour"]),
                 "max_clock_out_per_day":    _to_int(e_co_max_day.get(),   DEFAULT_SETTINGS["max_clock_out_per_day"]),
 
+                # SMS settings
+                "enable_sms_clock_out_reminder": enable_sms,
+                "sms_phone_e164": phone_norm,
+                "sms_only_after_hour":  _to_int(e_sms_after.get(), DEFAULT_SETTINGS["sms_only_after_hour"]),
+                "sms_idle_threshold_min": _to_int(e_sms_idle.get(), DEFAULT_SETTINGS["sms_idle_threshold_min"]),
+                "sms_max_per_day":       DEFAULT_SETTINGS["sms_max_per_day"],
+
                 # keep internal cutoff stable
                 "active_idle_cutoff_sec":   DEFAULT_SETTINGS["active_idle_cutoff_sec"],
             }
@@ -392,6 +507,22 @@ def open_config(icon, item):
             on_close()
 
         ttk.Button(btns, text="Save & Close", command=on_save_and_close).grid(column=0, row=0)
+
+        # Bottom row: Test SMS notification (uses Twilio)
+        r += 1
+        def _test_sms():
+            raw = e_sms_phone.get().strip()
+            e164 = _normalize_phone_e164(raw)
+            if not e164:
+                messagebox.showerror("Invalid phone", "Enter a valid phone number with +country code. Example: +353861234567")
+                return
+            ok = _send_sms_twilio(e164, "Moffett Clocker Helper test. Still working? This is a test SMS.")
+            if ok:
+                messagebox.showinfo("SMS", "Test SMS sent.")
+            else:
+                messagebox.showwarning("SMS", "SMS failed. Check Twilio creds, trial limits, or network.")
+
+        ttk.Button(frm, text="Test SMS notification (use sparingly)", command=_test_sms).grid(column=0, row=r, sticky="w")
 
         def on_close():
             global _config_window_open
