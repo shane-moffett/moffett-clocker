@@ -21,9 +21,13 @@ STATE_FILE = os.path.join(APPDATA_DIR, "status.txt")
 LAST_OFF_PROMPT_FILE = os.path.join(APPDATA_DIR, "last_off_prompt.txt")
 LAST_ON_PROMPT_FILE  = os.path.join(APPDATA_DIR, "last_on_prompt.txt")
 COUNTS_FILE          = os.path.join(APPDATA_DIR, "prompt_counts.json")  # per-day counts
+
+# Monthly SMS budget (calendar month)
+MONTH_COUNTS_FILE = os.path.join(APPDATA_DIR, "prompt_counts_month.json")
+
 SETTINGS_FILE        = os.path.join(APPDATA_DIR, "settings.json")
 
-# Fixed poll: 5 minutes
+# Fixed poll interval
 POLL_INTERVAL_SEC = 10
 
 # --------------------------
@@ -32,7 +36,7 @@ POLL_INTERVAL_SEC = 10
 DEFAULT_SETTINGS = {
     # OFF state: user active but not clocked in -> "Forgot to clock in?"
     "enable_clock_in_reminder": True,
-    "clock_in_cutoff_hour": 15,            # 0–23, only show before this hour
+    "clock_in_cutoff_hour": 15,            # 1–24, only show before this hour (24 = all day)
     "active_threshold_off_min": 30,        # minutes of continuous activity before prompting
     "off_prompt_cooldown_min": 210,        # min gap between prompts (minutes) ~3.5h
     "max_clock_in_per_day": 3,             # daily max
@@ -44,12 +48,21 @@ DEFAULT_SETTINGS = {
     "on_idle_after_hour": 0,               # only show this after (0–23). 0 = always allowed
     "max_clock_out_per_day": 3,            # daily max
 
-    # SMS clock-out reminder (max 1/day)
+    # SMS clock-out reminder
     "enable_sms_clock_out_reminder": False,
     "sms_phone_e164": "",                  # normalized +E.164 (e.g., +358401234567)
-    "sms_only_after_hour": 0,              # 0–23
+    "sms_only_after_hour": 0,              # (kept for backward compat; unused by new window check)
     "sms_idle_threshold_min": 60,          # minutes
-    "sms_max_per_day": 1,                  # fixed 1/day as requested
+    "sms_max_per_day": 1,                  # per-day cap
+    "sms_window_start_hour": 12,           # 0–23 inclusive
+    "sms_window_end_hour": 22,             # 1–24 exclusive; 24 = midnight
+    "sms_max_per_month": 10,               # hard monthly cap
+
+    # Notification days (applies to all reminders)
+    "notify_days": {                       # Monday..Sunday
+        "mon": True, "tue": True, "wed": True, "thu": True,
+        "fri": True, "sat": False, "sun": False
+    },
 
     # General (not user-exposed)
     "active_idle_cutoff_sec": 300          # idle >= this resets "active" streak (seconds)
@@ -144,6 +157,44 @@ def _save_counts(data):
     except Exception:
         pass
 
+# --------------------------
+# MONTHLY COUNTS (SMS budget)
+# --------------------------
+def _this_month():
+    return datetime.now().strftime("%Y-%m")
+
+def _load_month_counts():
+    os.makedirs(APPDATA_DIR, exist_ok=True)
+    current = _this_month()
+    data = {"month": current, "sms": 0}
+    try:
+        if os.path.exists(MONTH_COUNTS_FILE):
+            with open(MONTH_COUNTS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f) or {}
+            if loaded.get("month") == current:
+                data = {"month": current, "sms": int(loaded.get("sms", 0))}
+    except Exception:
+        pass
+    if data.get("month") != current:
+        data = {"month": current, "sms": 0}
+    return data
+
+def _save_month_counts(data):
+    try:
+        with open(MONTH_COUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+def get_month_sms_count() -> int:
+    return int(_load_month_counts().get("sms", 0))
+
+def inc_month_sms_count():
+    data = _load_month_counts()
+    data["sms"] = int(data.get("sms", 0)) + 1
+    _save_month_counts(data)
+
+
 def get_count(kind: str) -> int:
     data = _load_counts()
     return int(data.get(kind, 0))
@@ -170,6 +221,40 @@ icons = {
     "On": load_icon(m_on_b64),
     "Off": load_icon(m_off_b64),
 }
+
+from PIL import ImageDraw  # already imported PIL.Image, so extend here
+
+def make_gleam_frames(base_icon: Image.Image, steps=20) -> list[Image.Image]:
+    """Return a sequence of icons with a pure white diagonal gleam, masked by the icon's alpha."""
+    frames = []
+    w, h = base_icon.size
+
+    # Extract alpha channel from the base icon (shape of the "M")
+    mask = base_icon.convert("RGBA").split()[3]
+
+    for i in range(steps):
+        # Start with transparent canvas
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay, "RGBA")
+
+        offset = int((i / (steps - 1)) * (w + h))
+
+        # Draw the pure white diagonal band
+        draw.line(
+            [(offset - h, 0), (offset, h)],
+            fill=(255, 255, 255, 255),  # pure white, fully opaque
+            width=14
+        )
+
+        # Apply mask so the gleam only shows where the icon is opaque
+        overlay = Image.composite(overlay, Image.new("RGBA", (w, h), (0, 0, 0, 0)), mask)
+
+        # Merge overlay onto the base icon
+        frame = Image.alpha_composite(base_icon.convert("RGBA"), overlay)
+
+        frames.append(frame)
+
+    return frames
 
 # --------------------------
 # STATE PERSISTENCE
@@ -223,6 +308,66 @@ def load_last_off_prompt_epoch(): return _load_epoch_file(LAST_OFF_PROMPT_FILE)
 def save_last_off_prompt_epoch(epoch): _save_epoch_file(LAST_OFF_PROMPT_FILE, epoch)
 def load_last_on_prompt_epoch():  return _load_epoch_file(LAST_ON_PROMPT_FILE)
 def save_last_on_prompt_epoch(epoch): _save_epoch_file(LAST_ON_PROMPT_FILE, epoch)
+
+# --------------------------
+# DAY/HOUR GATING HELPERS
+# --------------------------
+def _weekday_key(dt=None) -> str:
+    # Monday=0 .. Sunday=6 -> "mon".."sun"
+    names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    w = (dt or datetime.now()).weekday()
+    return names[w]
+
+def is_notification_day_enabled(cfg, dt=None) -> bool:
+    days = cfg.get("notify_days", {})
+    return bool(days.get(_weekday_key(dt), True))
+
+def is_in_hour_window(start_hour: int, end_hour: int, now_hour: int) -> bool:
+    """
+    Window is [start, end) in 24h. end=24 means until midnight.
+    Supports wrap-around, e.g., 22..6  => 22,23,0..5 are allowed.
+    """
+    s = max(0, min(23, int(start_hour)))
+    e = max(1, min(24, int(end_hour)))
+    h = max(0, min(23, int(now_hour)))
+
+    if s == e:
+        # Treat equal as full-day allowed to avoid accidental total block
+        return True
+
+    if s < e:
+        return s <= h < e
+    else:
+        # wrap across midnight
+        return h >= s or h < e
+
+def is_before_cutoff_local(cutoff_hour):
+    """
+    "Only before 1–24" semantics.
+    24 = always allowed (entire day).
+    """
+    try:
+        cutoff = int(cutoff_hour)
+    except Exception:
+        cutoff = 24
+    if cutoff >= 24:
+        return True
+    if cutoff < 1:
+        cutoff = 1
+    return datetime.now().hour < cutoff
+
+def is_after_cutoff_local(after_hour):
+    """
+    "Only after 0–23" semantics.
+    0 = always allowed.
+    """
+    try:
+        a = int(after_hour)
+    except Exception:
+        a = 0
+    a = max(0, min(23, a))
+    return datetime.now().hour >= a
+
 
 # --------------------------
 # PHONE NORMALIZATION + SMS SENDER
@@ -280,12 +425,6 @@ def _send_sms_twilio(e164: str, body: str) -> bool:
 _current_status = None
 _active_streak_seconds = 0.0
 
-def is_before_cutoff_local(cutoff_hour):
-    return datetime.now().hour < int(cutoff_hour)
-
-def is_after_cutoff_local(after_hour):
-    return datetime.now().hour >= int(after_hour)
-
 def monitor_loop(icon: Icon):
     global _current_status, _active_streak_seconds
 
@@ -295,6 +434,12 @@ def monitor_loop(icon: Icon):
             status = _current_status
             idle_s = get_idle_seconds_windows()
             now = time.time()
+            now_hour = datetime.now().hour
+
+            # Global day gating: if today's unchecked, skip all notifications
+            if not is_notification_day_enabled(cfg):
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
             # ON: idle reminder (clock-out nudge)
             if status == "On" and cfg.get("enable_clock_out_idle_reminder", True):
@@ -334,16 +479,22 @@ def monitor_loop(icon: Icon):
 
             # SMS: ON state independent of desktop reminder
             if status == "On" and cfg.get("enable_sms_clock_out_reminder", False):
-                sms_after_hour = int(cfg.get("sms_only_after_hour", 0))
                 sms_idle_threshold_sec = int(cfg.get("sms_idle_threshold_min", 60)) * 60
-                sms_limit = max(0, int(cfg.get("sms_max_per_day", 1)))
+                sms_daily_limit = max(0, int(cfg.get("sms_max_per_day", 1)))
+                sms_monthly_limit = max(0, int(cfg.get("sms_max_per_month", 10)))
                 phone = str(cfg.get("sms_phone_e164", "")).strip()
 
-                if phone and idle_s >= sms_idle_threshold_sec and is_after_cutoff_local(sms_after_hour):
-                    if get_count("sms") < sms_limit:
+                # Hour window check
+                s = int(cfg.get("sms_window_start_hour", 12))
+                e = int(cfg.get("sms_window_end_hour", 24))
+                in_window = is_in_hour_window(s, e, now_hour)
+
+                if phone and in_window and (idle_s >= sms_idle_threshold_sec):
+                    if get_count("sms") < sms_daily_limit and get_month_sms_count() < sms_monthly_limit:
                         msg = "Still working? You are idle while clocked in. Open HealthBox to clock out: " + BASE_URL
                         if _send_sms_twilio(phone, msg):
                             inc_count("sms")
+                            inc_month_sms_count()
                             try:
                                 icon.notify("SMS clock-out reminder sent", "Moffett Clocker Helper")
                             except Exception:
@@ -354,6 +505,22 @@ def monitor_loop(icon: Icon):
             pass
 
         time.sleep(POLL_INTERVAL_SEC)
+
+def gleam_loop(icon: Icon):
+    base_off = icons["Off"]
+    frames = make_gleam_frames(base_off, steps=20)
+    while True:
+        try:
+            if _current_status == "Off":
+                for f in frames:
+                    icon.icon = f
+                    time.sleep(0.04)
+                icon.icon = base_off
+                time.sleep(60)       # wait 1 min before next gleam
+            else:
+                time.sleep(10)
+        except Exception:
+            pass
 
 # --------------------------
 # ACTIONS
@@ -411,13 +578,13 @@ def open_config(icon, item):
 
         frm = ttk.Frame(root, padding=14)
         frm.grid(sticky="nsew")
-        frm.columnconfigure(0, weight=1, minsize=340)
+        frm.columnconfigure(0, weight=1, minsize=360)
         frm.columnconfigure(1, weight=0)
 
-        # Helper to add a row with Entry or Checkbutton
-        def add_entry_row(row, label_text, initial_text):
+        # Helpers
+        def add_entry_row(row, label_text, initial_text, width=8):
             ttk.Label(frm, text=label_text).grid(column=0, row=row, sticky="w", padx=(0,10), pady=2)
-            e = ttk.Entry(frm, width=8, justify="center")
+            e = ttk.Entry(frm, width=width, justify="center")
             e.insert(0, str(initial_text))
             e.grid(column=1, row=row, sticky="e")
             return e
@@ -427,14 +594,46 @@ def open_config(icon, item):
             ttk.Checkbutton(frm, text=label_text, variable=var).grid(column=0, row=row, columnspan=2, sticky="w")
             return var
 
+        def _to_int(val, default):
+            try:
+                return int(str(val).strip())
+            except Exception:
+                return default
+
+        def _clamp(v, lo, hi):
+            try:
+                v = int(v)
+            except Exception:
+                return lo
+            return max(lo, min(hi, v))
+
         r = 0
+
+        # ---------------- Notification days ----------------
+        ttk.Label(frm, text="Notification days", font=("Segoe UI", 10, "bold")).grid(column=0, row=r, columnspan=2, sticky="w"); r += 1
+        days_cfg = cfg.get("notify_days", {})
+        defaults = {"mon": True,"tue": True,"wed": True,"thu": True,"fri": True,"sat": False,"sun": False}
+        days_cfg = {**defaults, **(days_cfg or {})}
+
+        day_vars = {}
+        day_labels = [("Mon","mon"),("Tue","tue"),("Wed","wed"),("Thu","thu"),("Fri","fri"),("Sat","sat"),("Sun","sun")]
+        day_frame = ttk.Frame(frm); day_frame.grid(column=0, row=r, columnspan=2, sticky="w", pady=(0,6)); r += 1
+        for i,(label,key) in enumerate(day_labels):
+            var = tk.BooleanVar(value=bool(days_cfg.get(key, True)))
+            ttk.Checkbutton(day_frame, text=label, variable=var).grid(column=i, row=0, padx=(0,8), sticky="w")
+            day_vars[key] = var
+
+        ttk.Separator(frm).grid(column=0, row=r, columnspan=2, sticky="ew", pady=8); r += 1
+
+        # ---------------- Clock-in reminder ----------------
         ttk.Label(frm, text="Clock-in reminder", font=("Segoe UI", 10, "bold")).grid(column=0, row=r, columnspan=2, sticky="w", pady=(0,2)); r+=1
         v_enable_ci   = add_check_row(r, "Remind me to clock in", cfg.get("enable_clock_in_reminder", True)); r+=1
-        e_cutoff      = add_entry_row(r, "Only show this before (0–23):", cfg.get("clock_in_cutoff_hour", 15)); r+=1
+        e_cutoff      = add_entry_row(r, "Only show this before (1–24):", cfg.get("clock_in_cutoff_hour", 15)); r+=1
         e_active_min  = add_entry_row(r, "Active before reminder (minutes):", cfg.get("active_threshold_off_min", 30)); r+=1
         e_ci_cool     = add_entry_row(r, "Min gap between reminders (minutes):", cfg.get("off_prompt_cooldown_min", 210)); r+=1
         e_ci_max_day  = add_entry_row(r, "Max reminders per day:", cfg.get("max_clock_in_per_day", 3)); r+=1
 
+        # ---------------- Clock-out reminder ----------------
         ttk.Label(frm, text="Clock-out reminder", font=("Segoe UI", 10, "bold")).grid(column=0, row=r, columnspan=2, sticky="w", pady=(8,2)); r+=1
         v_enable_co   = add_check_row(r, "Remind me if I go idle", cfg.get("enable_clock_out_idle_reminder", True)); r+=1
         e_after_hour  = add_entry_row(r, "Only show this after (0–23):", cfg.get("on_idle_after_hour", 0)); r+=1
@@ -442,8 +641,8 @@ def open_config(icon, item):
         e_co_cool     = add_entry_row(r, "Min gap between reminders (minutes):", cfg.get("on_idle_prompt_cooldown_min", 210)); r+=1
         e_co_max_day  = add_entry_row(r, "Max reminders per day:", cfg.get("max_clock_out_per_day", 3)); r+=1
 
-        # SMS clock-out reminder (max 1/day)
-        ttk.Label(frm, text="SMS clock-out reminder (max 1/day)", font=("Segoe UI", 10, "bold")).grid(column=0, row=r, columnspan=2, sticky="w", pady=(8,2)); r+=1
+        # ---------------- SMS clock-out ----------------
+        ttk.Label(frm, text="SMS clock-out reminder", font=("Segoe UI", 10, "bold")).grid(column=0, row=r, columnspan=2, sticky="w", pady=(8,2)); r+=1
         v_enable_sms  = add_check_row(r, "Send SMS if I go idle", cfg.get("enable_sms_clock_out_reminder", False)); r+=1
 
         ttk.Label(frm, text="Phone number (+country code):").grid(column=0, row=r, sticky="w", padx=(0,10), pady=2)
@@ -451,10 +650,23 @@ def open_config(icon, item):
         e_sms_phone.insert(0, str(cfg.get("sms_phone_e164", "")))
         e_sms_phone.grid(column=1, row=r, sticky="e"); r+=1
 
-        e_sms_after  = add_entry_row(r, "Only send this after (0–23):", cfg.get("sms_only_after_hour", 0)); r+=1
-        e_sms_idle   = add_entry_row(r, "Idle before SMS reminder (minutes):", cfg.get("sms_idle_threshold_min", 60)); r+=1
+        e_sms_start  = add_entry_row(r, "Only send between start hour (0–23):", cfg.get("sms_window_start_hour", 12)); r+=1
+        e_sms_end    = add_entry_row(r, "Only send between end hour (1–24):",   cfg.get("sms_window_end_hour", 22)); r+=1
+        e_sms_idle   = add_entry_row(r, "Idle before SMS reminder (minutes):",  cfg.get("sms_idle_threshold_min", 60)); r+=1
 
-        ttk.Separator(frm).grid(column=0, row=r, columnspan=2, sticky="ew", pady=10); r+=1
+        # Budget / caps row
+        month_used = get_month_sms_count()
+        month_cap  = int(cfg.get("sms_max_per_month", 10))
+        budget_text = f"Monthly SMS budget: {month_used} / {month_cap}"
+        budget_label = ttk.Label(frm, text=budget_text)
+        budget_label.grid(column=0, row=r, columnspan=2, sticky="w", pady=(4,0)); r += 1
+
+        ttk.Label(
+            frm,
+            text="Max 1/day & 10/month to cap costs, and remember to buy Shane a pint."
+        ).grid(column=0, row=r, columnspan=2, sticky="w", pady=(0,8)); r += 1
+
+        ttk.Separator(frm).grid(column=0, row=r, columnspan=2, sticky="ew", pady=8); r+=1
 
         # Test buttons
         leftbtns = ttk.Frame(frm); leftbtns.grid(column=0, row=r, sticky="w")
@@ -462,12 +674,6 @@ def open_config(icon, item):
         ttk.Button(leftbtns, text="Test clock-out notification", command=lambda: icon.notify("Still working? (test)", "Moffett Clocker Helper")).grid(column=1, row=0)
 
         btns = ttk.Frame(frm); btns.grid(column=1, row=r, sticky="e")
-
-        def _to_int(val, default):
-            try:
-                return int(str(val).strip())
-            except Exception:
-                return default
 
         def on_save_and_close():
             # Normalize phone if enabled
@@ -479,9 +685,15 @@ def open_config(icon, item):
                 messagebox.showerror("Invalid phone", "Enter a valid phone number with +country code. Example: +358401234567")
                 return
 
+            # Hours validation
+            ci_cutoff = _clamp(e_cutoff.get(), 1, 24)     # 24 = all day
+            co_after  = _clamp(e_after_hour.get(), 0, 23) # 0 = always
+            win_start = _clamp(e_sms_start.get(), 0, 23)
+            win_end   = _clamp(e_sms_end.get(), 1, 24)
+
             new_cfg = {
                 "enable_clock_in_reminder": bool(v_enable_ci.get()),
-                "clock_in_cutoff_hour": _to_int(e_cutoff.get(),           DEFAULT_SETTINGS["clock_in_cutoff_hour"]),
+                "clock_in_cutoff_hour": ci_cutoff,
                 "active_threshold_off_min": _to_int(e_active_min.get(),   DEFAULT_SETTINGS["active_threshold_off_min"]),
                 "off_prompt_cooldown_min":  _to_int(e_ci_cool.get(),      DEFAULT_SETTINGS["off_prompt_cooldown_min"]),
                 "max_clock_in_per_day":     _to_int(e_ci_max_day.get(),   DEFAULT_SETTINGS["max_clock_in_per_day"]),
@@ -489,15 +701,21 @@ def open_config(icon, item):
                 "enable_clock_out_idle_reminder": bool(v_enable_co.get()),
                 "on_idle_threshold_min":    _to_int(e_idle_min.get(),     DEFAULT_SETTINGS["on_idle_threshold_min"]),
                 "on_idle_prompt_cooldown_min": _to_int(e_co_cool.get(),   DEFAULT_SETTINGS["on_idle_prompt_cooldown_min"]),
-                "on_idle_after_hour":       _to_int(e_after_hour.get(),   DEFAULT_SETTINGS["on_idle_after_hour"]),
+                "on_idle_after_hour":       co_after,
                 "max_clock_out_per_day":    _to_int(e_co_max_day.get(),   DEFAULT_SETTINGS["max_clock_out_per_day"]),
 
                 # SMS settings
                 "enable_sms_clock_out_reminder": enable_sms,
                 "sms_phone_e164": phone_norm,
-                "sms_only_after_hour":  _to_int(e_sms_after.get(), DEFAULT_SETTINGS["sms_only_after_hour"]),
+                "sms_only_after_hour":  DEFAULT_SETTINGS["sms_only_after_hour"],  # legacy, keep stable
                 "sms_idle_threshold_min": _to_int(e_sms_idle.get(), DEFAULT_SETTINGS["sms_idle_threshold_min"]),
                 "sms_max_per_day":       DEFAULT_SETTINGS["sms_max_per_day"],
+                "sms_window_start_hour": win_start,
+                "sms_window_end_hour":   win_end,
+                "sms_max_per_month":     DEFAULT_SETTINGS["sms_max_per_month"],
+
+                # Notification days
+                "notify_days": {k: bool(v.get()) for k, v in day_vars.items()},
 
                 # keep internal cutoff stable
                 "active_idle_cutoff_sec":   DEFAULT_SETTINGS["active_idle_cutoff_sec"],
@@ -509,20 +727,48 @@ def open_config(icon, item):
         ttk.Button(btns, text="Save & Close", command=on_save_and_close).grid(column=0, row=0)
 
         # Bottom row: Test SMS notification (uses Twilio)
-        r += 1
         def _test_sms():
             raw = e_sms_phone.get().strip()
             e164 = _normalize_phone_e164(raw)
             if not e164:
-                messagebox.showerror("Invalid phone", "Enter a valid phone number with +country code. Example: +353861234567")
+                messagebox.showerror(
+                    "Invalid phone",
+                    "Enter a valid phone number with +country code. Example: +353861234567"
+                )
                 return
-            ok = _send_sms_twilio(e164, "Moffett Clocker Helper test. Still working? This is a test SMS.")
+
+            # Use latest saved caps (not unsaved edits)
+            caps = get_settings()
+            daily_cap = int(caps.get("sms_max_per_day", 1))
+            monthly_cap = int(caps.get("sms_max_per_month", 10))
+
+            # Hard-gate before sending
+            if get_count("sms") >= daily_cap:
+                messagebox.showwarning("SMS", "Daily SMS cap reached; test blocked.")
+                return
+            if get_month_sms_count() >= monthly_cap:
+                messagebox.showwarning("SMS", "Monthly SMS cap reached; test blocked.")
+                return
+
+            ok = _send_sms_twilio(
+                e164,
+                "Moffett Clocker Helper test. Still working? This is a test SMS."
+            )
             if ok:
-                messagebox.showinfo("SMS", "Test SMS sent.")
+                inc_count("sms")          # counts toward daily cap
+                inc_month_sms_count()     # counts toward 10/month
+                messagebox.showinfo("SMS", "Test SMS sent (counted toward daily & monthly caps).")
+                try:
+                    month_used_now = get_month_sms_count()
+                    budget_label.config(text=f"Monthly SMS budget: {month_used_now} / {monthly_cap}")
+                except Exception:
+                    pass
             else:
                 messagebox.showwarning("SMS", "SMS failed. Check Twilio creds, trial limits, or network.")
 
-        ttk.Button(frm, text="Test SMS notification (use sparingly)", command=_test_sms).grid(column=0, row=r, sticky="w")
+        r += 1
+        ttk.Button(frm, text="Test SMS notification (use sparingly)", command=_test_sms)\
+            .grid(column=0, row=r, sticky="w")
 
         def on_close():
             global _config_window_open
@@ -534,7 +780,6 @@ def open_config(icon, item):
 
         root.protocol("WM_DELETE_WINDOW", on_close)
         root.mainloop()
-        _config_window_open = False
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -565,6 +810,7 @@ def run_tray():
     icon.title = "Moffett Clocker Helper"
 
     threading.Thread(target=monitor_loop, args=(icon,), daemon=True).start()
+    threading.Thread(target=gleam_loop, args=(icon,), daemon=True).start()
     icon.run()
 
 if __name__ == "__main__":
